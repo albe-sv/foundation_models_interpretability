@@ -24,6 +24,10 @@ import scanpy as sc
 import torch
 
 from pipeline import config as C
+from pipeline.postprocess.enrichment import task_enrichment
+from pipeline.postprocess.enrichment_summary import task_enrichment_summary
+from pipeline.postprocess.gene_matrix import task_gene_matrix
+from pipeline.postprocess.gwas_similarity import task_gwas_similarity
 from pipeline.steps import _step7_common as common
 from pipeline.steps import step7_explainability_ig as ig
 from pipeline.utils.scgpt_model import load_model_configs, load_vocab
@@ -114,7 +118,15 @@ def task_ig_lora(results_dir: Path, device: torch.device) -> None:
     del model
     torch.cuda.empty_cache()
 
-TASKS = {"attention": task_attention, "ig_lora": task_ig_lora}
+# Tasks of the pipeline 
+MODEL_TASKS = {"attention": task_attention, "ig_lora": task_ig_lora}
+POSTPROCESS_TASKS = {
+    "enrichment": task_enrichment,
+    "enrichment_summary": task_enrichment_summary,
+    "gwas_similarity": task_gwas_similarity,
+    "gene_matrix": task_gene_matrix,
+}
+TASKS = {**MODEL_TASKS, **POSTPROCESS_TASKS}
 
 def main():
     # This seed is for the binning of tied expression values in scGPT's preprocess
@@ -127,9 +139,14 @@ def main():
     args = p.parse_args()
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    for name in (list(TASKS) if args.task == "all" else [args.task]):
+    # --task all only runs the two GPU-bound model tasks, because the post-hoc
+    # analyses depend on their output and are run individually.
+    for name in (list(MODEL_TASKS) if args.task == "all" else [args.task]):
         print(f"\n# {name} #")
-        TASKS[name](args.results_dir, device)
+        if name in MODEL_TASKS:
+            TASKS[name](args.results_dir, device)
+        else:
+            TASKS[name](args.results_dir)
 
 if __name__ == "__main__":
     main()

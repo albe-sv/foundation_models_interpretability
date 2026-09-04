@@ -8,3 +8,8 @@ einops==0.8.2
 captum==0.9.0
 scgpt==0.2.4
 flash-attn==1.0.4
+pandas==2.3.3
+gprofiler-official==1.0.0
+gseapy==1.2.1
+matplotlib==3.10.8
+go3==1.0.0

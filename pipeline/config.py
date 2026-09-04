@@ -40,3 +40,10 @@ SPECIAL_TOKENS = [PAD_TOKEN, "<cls>", "<eoc>"]
 PAD_VALUE = -2
 N_BINS = 51
 MAX_SEQ_LEN = 1001  # n_top_genes (1000) + 1, as used for this run
+
+# go3/gwas_similarity/gene_matrix postprocess steps expect the monorepo's own
+# GO ontology and gene-annotation file symlinked here (data/ is gitignored):
+#   data/go3_refs/go-basic.obo  -> ../../../../GO3/go-basic.obo
+#   data/go3_refs/goa_human.gaf -> ../../../../data/goa_human.gaf
+# go3 itself is not on PyPI; it must already be importable in the environment
+# (it is, inside scgpt_env).
