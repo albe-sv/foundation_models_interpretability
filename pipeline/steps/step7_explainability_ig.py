@@ -18,7 +18,6 @@ How it works:
 
 from typing import Dict, Tuple
 
-from tqdm import tqdm
 import numpy as np
 import torch
 from captum.attr import IntegratedGradients
@@ -58,7 +57,6 @@ def _ig_batch(model: torch.nn.Module, gids: torch.Tensor, vals: torch.Tensor,
         additional_forward_args=(gids, mask),
         n_steps=n_steps,
         method="gausslegendre",
-	internal_batch_size=64
     )
     return attrs.detach().float().cpu().numpy()
 
@@ -85,7 +83,7 @@ def _compute_ig_importance(
     labels_all = pt["condition_labels"].numpy()
     preds_all = np.empty(n_cells, dtype=np.int64)
     # Iterate over cells and classified them
-    for start in tqdm(range(0, n_cells, classify_batch_size), leave=False):
+    for start in range(0, n_cells, classify_batch_size):
         # Special case for last batch
         end = min(start + classify_batch_size, n_cells)
         gids = pt["gene_ids"][start:end].to(device)
@@ -105,7 +103,7 @@ def _compute_ig_importance(
     cnt: Dict[int, int] = {}
 
     # Iterate over the correctly classified cells in batches, computing IG for each
-    for start in tqdm(range(0, n_used, batch_size), leave=False):
+    for start in range(0, n_used, batch_size):
         # Special case for last batch
         end = min(start + batch_size, n_used)
 

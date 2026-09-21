@@ -163,132 +163,59 @@ def _cls_attn_rank_norm_head_avg(
 
 # Forward pass to compute attention for the CLS token
 def _forward_cls_attention(
-    model: nn.Module,
-    batch_pt: Dict[str, torch.Tensor],
-    vocab,
-    n_head: int,
-    device: torch.device,
-    n_cls: int,
+    model: nn.Module, batch_pt: Dict[str, torch.Tensor],
+    vocab, n_head: int, device: torch.device, n_cls: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-    # Token and gene ids / values
+    # The token and gene ids and values
     pad_id = vocab[C.PAD_TOKEN]
     gids = batch_pt["gene_ids"].to(device)
     vals = batch_pt["values"].to(device)
 
-    # True at padded positions
+    # True to padded position (not all cells are equal length)
     mask = gids.eq(pad_id)
 
-    # Capture input to the last attention layer
-    capture = _LayerInputCapture(
-        model.transformer_encoder.layers[NUM_ATTN_LAYERS]
-    )
-
+    capture = _LayerInputCapture(model.transformer_encoder.layers[NUM_ATTN_LAYERS])
     try:
-        with torch.no_grad(), torch.cuda.amp.autocast(
-            enabled=(device.type == "cuda")
-        ):
-            output = model(
-                gids,
-                vals,
-                src_key_padding_mask=mask,
-                batch_labels=None,
-                CLS=True,
-                CCE=False,
-                MVC=False,
-                ECS=False,
-            )
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            output = model(gids, vals, src_key_padding_mask=mask, batch_labels=None,
+                           CLS=True, CCE=False, MVC=False, ECS=False)
     finally:
         capture.remove()
+    embs = capture.captured.float()
 
-    embs = capture.captured
+    # FlashMHA of the last encoder layer
+    self_attn = model.transformer_encoder.layers[NUM_ATTN_LAYERS].self_attn
 
-    if embs is None:
-        raise RuntimeError("Failed to capture encoder layer input")
-
-    # With use_fast_transformer=False and NestedTensor disabled,
-    # this should be a regular dense tensor.
-    if getattr(embs, "is_nested", False):
-        raise RuntimeError(
-            "Unexpected NestedTensor captured. "
-            "Check that use_fast_transformer=False and "
-            "enable_nested_tensor=False."
-        )
-
-    embs = embs.float()
-
-    # This MUST match the original input sequence.
-    if embs.shape[:2] != gids.shape[:2]:
-        raise RuntimeError(
-            f"Captured embeddings and input have different shapes: "
-            f"embs={embs.shape}, gids={gids.shape}"
-        )
-
-    # Last encoder layer attention
-    self_attn = model.transformer_encoder.layers[
-        NUM_ATTN_LAYERS
-    ].self_attn
-
-    # ---------------------------------------------------------
-    # Q, K, V projection
-    # ---------------------------------------------------------
-
-    if hasattr(self_attn, "Wqkv"):
-        # FlashMHA / scGPT implementation
-        qkv = self_attn.Wqkv(embs)
-
-    elif hasattr(self_attn, "in_proj_weight"):
-        # Standard PyTorch MultiheadAttention
-        qkv = torch.nn.functional.linear(
-            embs,
-            self_attn.in_proj_weight,
-            self_attn.in_proj_bias,
-        )
-
-    else:
-        raise RuntimeError(
-            f"Unsupported attention implementation: {type(self_attn)}"
-        )
-
-    qkv = qkv.float()
-
-    # [B, S, 3*D] -> [B, S, 3, H, D_head]
-    qkv = rearrange(
-        qkv,
-        "b s (three h d) -> b s three h d",
-        three=3,
-        h=n_head,
-    )
-
+    # Compute Q, K and V
+    qkv = self_attn.Wqkv(embs)
+    # Separate the 1536 dimension of QKV to individual variables
+    # Index 0 if Q
+    # Index 1 is K
+    # Index 2 is V
+    qkv = rearrange(qkv, "b s (three h d) -> b s three h d", three=3, h=n_head)
     q = qkv[:, :, 0, :, :]
     k = qkv[:, :, 1, :, :]
 
-    # CLS query: first token
+    # The first token of Q is the CLS (0:1)
     q_cls = q[:, 0:1, :, :].permute(0, 2, 1, 3)
 
-    # K transpose
+    # Transpose of K
     k_t = k.permute(0, 2, 3, 1)
 
-    # Same calculation as original implementation.
-    # NOTE: no sqrt(d_k) here, intentionally, to preserve
-    # the original results.
+    # Attention = Q*K^T / sqrt(d_k)
     cls_scores = (q_cls @ k_t).squeeze(2)
 
-    # Rank-normalise and average heads
-    cls_attn = _cls_attn_rank_norm_head_avg(
-        cls_scores,
-        mask,
-    )
+    # AVERAGE the attention scores
+    cls_attn = _cls_attn_rank_norm_head_avg(cls_scores, mask)
 
-    # Classification output
+    # We need the final CLS output because we need the CORRECT CLASSIFIED cells 
     cls_output = output["cls_output"].float()
-
     if n_cls == 1:
         logits = cls_output.squeeze(1)
         preds = (logits > 0).long()
     else:
         preds = cls_output.argmax(dim=1)
-
     return cls_attn, preds
 
 # Caculate the attention between the CLS token and the gene tokens
