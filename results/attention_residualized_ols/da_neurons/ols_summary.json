@@ -1,0 +1,17 @@
+{
+  "n_genes": 1000,
+  "n_genes_used": 1000,
+  "predictors": [
+    "expression_mean",
+    "expression_variance",
+    "dropout_rate"
+  ],
+  "standardized_predictors": true,
+  "intercept": -0.0029605327325269307,
+  "coefficients_standardized": {
+    "expression_mean": -0.011247059457652989,
+    "expression_variance": 0.0036444504805231495,
+    "dropout_rate": -0.011164525662316446
+  },
+  "r_squared": 0.009998178716078887
+}
