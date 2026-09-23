@@ -1,0 +1,592 @@
+"""Dynamic top-N selection with donor-level permutation testing.
+
+Fixed selectors:
+  * top30: 30 highest method scores.
+  * z-score: score > mean + 2.5 * std.
+  * Otsu: genes above the Otsu threshold.
+  * elbow: Kneedle elbow on the descending score curve.
+
+Permutation selector:
+  * statistical unit = donor, never individual cells;
+  * PD/control donor labels are permuted while preserving the observed number
+    of PD and control donors;
+  * two-sided Cohen's d is calculated gene-wise for every permutation;
+  * empirical p-values are BH-adjusted to q-values;
+  * a gene is selected only when q < alpha AND |d| >= effect_size;
+  * selected genes are written sorted by the method's original score.
+
+For CSSI, the statistic is the maximum absolute Cohen's d across valid Leiden
+strata, with the same max-over-strata operation applied in every permutation.
+"""
+
+from pathlib import Path
+import csv
+import json
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import torch
+
+from pipeline import config as C
+from pipeline.steps import attention_cssi_leiden as cssi
+
+TOP_N = 30
+Z_THRESHOLD = 2.5
+OTSU_MAX_BINS = 256
+ELBOW_S = 1.0
+PERMUTATION_N = 2000
+PERMUTATION_ALPHA = 0.05
+PERMUTATION_EFFECT_SIZE = 0.5
+MIN_DONORS_PER_GROUP = 2
+
+
+def _ranked_items(score_map: Dict[str, float]) -> List[Tuple[str, float]]:
+    items = []
+    for gene, score in score_map.items():
+        score = float(score)
+        if np.isfinite(score):
+            items.append((str(gene), score))
+    items.sort(key=lambda x: (-x[1], x[0]))
+    return items
+
+
+def _select_top_k(items: List[Tuple[str, float]], k: int) -> List[Tuple[str, float]]:
+    return items[: max(1, min(int(k), len(items)))] if items else []
+
+
+def _zscore(items: List[Tuple[str, float]]) -> Tuple[List[Tuple[str, float]], dict]:
+    scores = np.asarray([s for _, s in items], dtype=float)
+    mu = float(scores.mean())
+    sigma = float(scores.std())
+    threshold = mu + Z_THRESHOLD * sigma
+    keep = scores > threshold
+    fallback = not bool(np.any(keep))
+    if fallback:
+        keep[np.argmax(scores)] = True
+    return [item for item, flag in zip(items, keep) if flag], {
+        "mean": mu,
+        "std": sigma,
+        "z_threshold": Z_THRESHOLD,
+        "threshold": threshold,
+        "fallback_top1": fallback,
+    }
+
+
+def _otsu_threshold(scores: np.ndarray) -> float:
+    if scores.size < 2 or np.all(scores == scores[0]):
+        return float(scores[0])
+    lo, hi = float(scores.min()), float(scores.max())
+    n_bins = min(OTSU_MAX_BINS, max(2, int(np.unique(scores).size)))
+    hist, edges = np.histogram(scores, bins=n_bins, range=(lo, hi))
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    w = hist.astype(float)
+    cw = np.cumsum(w)
+    cm = np.cumsum(w * centers)
+    total_w, total_m = cw[-1], cm[-1]
+    denom = cw * (total_w - cw)
+    between = np.zeros_like(cm)
+    valid = denom > 0
+    between[valid] = (total_m * cw[valid] - cm[valid]) ** 2 / denom[valid]
+    if between.size > 2:
+        between[0] = -np.inf
+        between[-1] = -np.inf
+    return float(centers[int(np.argmax(between))])
+
+
+def _otsu(items: List[Tuple[str, float]]) -> Tuple[List[Tuple[str, float]], dict]:
+    scores = np.asarray([s for _, s in items], dtype=float)
+    threshold = _otsu_threshold(scores)
+    keep = scores > threshold
+    fallback = not bool(np.any(keep))
+    if fallback:
+        keep[np.argmax(scores)] = True
+    return [item for item, flag in zip(items, keep) if flag], {
+        "threshold": threshold,
+        "fallback_top1": fallback,
+        "n_bins": min(OTSU_MAX_BINS, max(2, int(np.unique(scores).size))),
+    }
+
+
+def _elbow(items: List[Tuple[str, float]]) -> Tuple[List[Tuple[str, float]], dict]:
+    if len(items) == 1:
+        return items, {"k": 1, "fallback": "single_gene"}
+    try:
+        from kneed import KneeLocator
+    except ImportError as exc:
+        raise RuntimeError(
+            "The elbow selector requires kneed. Install it with "
+            "`pip install kneed==0.8.6`."
+        ) from exc
+    x = np.arange(1, len(items) + 1, dtype=float)
+    y = np.asarray([s for _, s in items], dtype=float)
+    locator = KneeLocator(
+        x, y, S=ELBOW_S, curve="convex", direction="decreasing", online=False
+    )
+    if locator.knee is None:
+        k = min(TOP_N, len(items))
+        meta = {"k": int(k), "fallback": "top30"}
+    else:
+        k = max(1, min(int(round(float(locator.knee))), len(items)))
+        meta = {"k": int(k), "fallback": None}
+    return _select_top_k(items, k), meta
+
+
+def _bh_adjust(p_values: np.ndarray) -> np.ndarray:
+    p_values = np.asarray(p_values, dtype=float)
+    if p_values.size == 0:
+        return p_values.copy()
+    order = np.argsort(p_values)
+    ranked = p_values[order]
+    adj = ranked * p_values.size / np.arange(1, p_values.size + 1, dtype=float)
+    adj = np.minimum.accumulate(adj[::-1])[::-1]
+    out = np.empty_like(adj)
+    out[order] = np.clip(adj, 0.0, 1.0)
+    return out
+
+
+def resolve_donor_column(adata, explicit: Optional[str] = None) -> str:
+    """Return an explicit donor column or a conservative donor-like match."""
+    if explicit:
+        if explicit not in adata.obs.columns:
+            raise ValueError(
+                f"Donor column {explicit!r} not present in adata.obs. "
+                f"Available columns: {list(adata.obs.columns)}"
+            )
+        return explicit
+
+    candidates = [
+        "donor", "donor_id", "donorID", "subject", "subject_id",
+        "individual", "individual_id", "patient", "patient_id",
+        "Brain_Bank_ID", "Brain_Bank_Path_ID", "brain_bank_id",
+    ]
+    present = [c for c in candidates if c in adata.obs.columns]
+    if not present:
+        raise ValueError(
+            "Could not identify a donor column automatically. Set --donor-col. "
+            f"Available adata.obs columns: {list(adata.obs.columns)}"
+        )
+    return present[0]
+
+
+def validate_donor_labels(donor_ids: np.ndarray, labels: np.ndarray):
+    donor_ids = np.asarray(donor_ids).astype(str)
+    labels = np.asarray(labels, dtype=int)
+    donors = np.unique(donor_ids)
+    donor_labels = np.empty(len(donors), dtype=int)
+    for i, donor in enumerate(donors):
+        unique = np.unique(labels[donor_ids == donor])
+        if unique.size != 1 or int(unique[0]) not in (0, 1):
+            raise ValueError(
+                f"Donor {donor!r} has non-unique/unrecognised diagnosis labels: "
+                f"{unique.tolist()}"
+            )
+        donor_labels[i] = int(unique[0])
+    return donors, donor_labels
+
+
+def _collect_donor_data(
+    all_attn: np.ndarray,
+    all_gids: np.ndarray,
+    labels: np.ndarray,
+    donor_ids: np.ndarray,
+    vocab,
+    strata: Optional[np.ndarray] = None,
+):
+    """Aggregate cell-level attention to donor x gene means, optionally per stratum."""
+    donors, donor_labels = validate_donor_labels(donor_ids, labels)
+    donor_to_idx = {d: i for i, d in enumerate(donors)}
+    special_ids = {vocab[t] for t in C.SPECIAL_TOKENS if t in vocab}
+    pad_id = vocab[C.PAD_TOKEN]
+
+    gene_ids = sorted({
+        int(gid)
+        for row in all_gids
+        for gid in row[1:]
+        if int(gid) != pad_id and int(gid) not in special_ids
+    })
+    genes = [str(vocab.lookup_tokens([gid])[0]) for gid in gene_ids]
+    gene_to_col = {gid: j for j, gid in enumerate(gene_ids)}
+    D, G = len(donors), len(genes)
+
+    pooled_sum = np.zeros((D, G), dtype=np.float64)
+    pooled_cnt = np.zeros((D, G), dtype=np.int32)
+    strata_sum = {}
+    strata_cnt = {}
+
+    for i in range(all_attn.shape[0]):
+        di = donor_to_idx[str(donor_ids[i])]
+        si = None if strata is None else int(strata[i])
+        if si is not None and si not in strata_sum:
+            strata_sum[si] = np.zeros((D, G), dtype=np.float64)
+            strata_cnt[si] = np.zeros((D, G), dtype=np.int32)
+        for pos in range(1, all_gids.shape[1]):
+            gid = int(all_gids[i, pos])
+            j = gene_to_col.get(gid)
+            if j is None:
+                continue
+            value = float(all_attn[i, pos])
+            pooled_sum[di, j] += value
+            pooled_cnt[di, j] += 1
+            if si is not None:
+                strata_sum[si][di, j] += value
+                strata_cnt[si][di, j] += 1
+
+    pooled = np.divide(
+        pooled_sum, pooled_cnt,
+        out=np.full_like(pooled_sum, np.nan, dtype=float),
+        where=pooled_cnt > 0,
+    )
+    strata_scores = {}
+    for si in sorted(strata_sum):
+        strata_scores[si] = np.divide(
+            strata_sum[si], strata_cnt[si],
+            out=np.full_like(strata_sum[si], np.nan, dtype=float),
+            where=strata_cnt[si] > 0,
+        )
+
+    return {
+        "donors": donors.tolist(),
+        "labels": donor_labels,
+        "genes": genes,
+        "scores": pooled,
+        "strata": strata_scores,
+    }
+
+
+def collect_donor_attention_data(
+    model,
+    pt: dict,
+    vocab,
+    n_head: int,
+    device: torch.device,
+    donor_ids,
+    *,
+    need_cssi: bool,
+    n_neighbors: int = 15,
+    target_k: int = 6,
+    random_state: int = 42,
+    batch_size: int = 16,
+    fixed_strata=None,
+):
+    """Run the model once and return donor-level attention data.
+
+    This is deliberately separate from `compute_attention_cssi` so the existing
+    CSSI code and its outputs remain unchanged. It is used only by the new
+    donor-permutation statistical selector.
+    """
+    donor_ids = np.asarray(donor_ids).astype(str)
+    if donor_ids.size != pt["gene_ids"].shape[0]:
+        raise ValueError("donor_ids must have one entry per tokenized cell")
+
+    attn_batches, gid_batches, labels_batches, emb_batches = [], [], [], []
+    n_cells = pt["gene_ids"].shape[0]
+    for start in range(0, n_cells, batch_size):
+        end = min(start + batch_size, n_cells)
+        batch = {k: v[start:end] for k, v in pt.items()}
+        if need_cssi and fixed_strata is None:
+            attn, _, emb = cssi._forward_cls_attention_with_embedding(
+                model, batch, vocab, n_head, device, n_cls=2
+            )
+            emb_batches.append(emb.cpu().numpy())
+        else:
+            attn, _ = __import__("pipeline.steps._step7_common", fromlist=["_"])._forward_cls_attention(
+                model, batch, vocab, n_head, device, n_cls=2
+            )
+        attn_batches.append(attn.cpu().numpy())
+        gid_batches.append(batch["gene_ids"].cpu().numpy())
+        labels_batches.append(batch["condition_labels"].cpu().numpy())
+
+    all_attn = np.concatenate(attn_batches, axis=0)
+    all_gids = np.concatenate(gid_batches, axis=0)
+    labels = np.concatenate(labels_batches, axis=0).astype(int)
+
+    strata = None
+    if fixed_strata is not None:
+        strata = np.asarray(fixed_strata, dtype=int)
+        if strata.size != n_cells:
+            raise ValueError("fixed_strata must have one label per cell")
+    elif need_cssi:
+        embeddings = np.concatenate(emb_batches, axis=0).astype(np.float32)
+        strata, _ = cssi._leiden_from_embeddings(
+            embeddings,
+            n_neighbors=n_neighbors,
+            target_k=target_k,
+            random_state=random_state,
+        )
+    data = _collect_donor_data(all_attn, all_gids, labels, donor_ids, vocab, strata)
+    return data
+
+
+def _cohen_d_from_groups(X: np.ndarray, group1: np.ndarray):
+    valid = np.isfinite(X)
+    g1 = group1.astype(bool)[:, None] & valid
+    g0 = (~group1.astype(bool))[:, None] & valid
+    n1 = g1.sum(axis=0).astype(float)
+    n0 = g0.sum(axis=0).astype(float)
+    X0 = np.where(valid, X, 0.0)
+    s1 = (g1 * X0).sum(axis=0)
+    s0 = (g0 * X0).sum(axis=0)
+    m1 = np.divide(s1, n1, out=np.full(X.shape[1], np.nan), where=n1 > 0)
+    m0 = np.divide(s0, n0, out=np.full(X.shape[1], np.nan), where=n0 > 0)
+    ss1 = (g1 * (X0 - m1[None, :]) ** 2).sum(axis=0)
+    ss0 = (g0 * (X0 - m0[None, :]) ** 2).sum(axis=0)
+    v1 = np.divide(ss1, n1 - 1, out=np.full(X.shape[1], np.nan), where=n1 > 1)
+    v0 = np.divide(ss0, n0 - 1, out=np.full(X.shape[1], np.nan), where=n0 > 1)
+    pv = np.divide(
+        (n1 - 1) * v1 + (n0 - 1) * v0,
+        n1 + n0 - 2,
+        out=np.full(X.shape[1], np.nan),
+        where=(n1 > 1) & (n0 > 1),
+    )
+    sd = np.sqrt(np.maximum(pv, 0.0))
+    d = np.divide(
+        m1 - m0,
+        sd,
+        out=np.full(X.shape[1], np.nan),
+        where=(n1 >= MIN_DONORS_PER_GROUP) & (n0 >= MIN_DONORS_PER_GROUP) & (sd > 0),
+    )
+    return d, n0.astype(int), n1.astype(int)
+
+
+def _permutation_labels(n_donors: int, n_pd: int, n_permutations: int, rng):
+    ranks = rng.random((n_permutations, n_donors)).argsort(axis=1)
+    labels = np.zeros((n_permutations, n_donors), dtype=bool)
+    labels[np.arange(n_permutations)[:, None], ranks[:, :n_pd]] = True
+    return labels
+
+
+def _permute_matrix_d(X, donor_labels, perm_labels):
+    """Return observed d and P x G null d for one donor x gene matrix."""
+    observed_d, n0_obs, n1_obs = _cohen_d_from_groups(X, donor_labels == 1)
+    P = perm_labels.shape[0]
+    D, G = X.shape
+    perm_labels = np.asarray(perm_labels, dtype=float)
+    if perm_labels.shape[1] != D:
+        raise ValueError("Permutation label matrix has the wrong donor dimension")
+    valid = np.isfinite(X)
+    X0 = np.where(valid, X, 0.0)
+    V = valid.astype(float)
+    sum1 = perm_labels @ X0
+    n1 = perm_labels @ V
+    total_sum = X0.sum(axis=0)[None, :]
+    total_n = V.sum(axis=0)[None, :]
+    sum0 = total_sum - sum1
+    n0 = total_n - n1
+    mean1 = np.divide(sum1, n1, out=np.full_like(sum1, np.nan), where=n1 > 0)
+    mean0 = np.divide(sum0, n0, out=np.full_like(sum0, np.nan), where=n0 > 0)
+    sq = X0 * X0
+    sq1 = perm_labels @ sq
+    sq0 = sq.sum(axis=0)[None, :] - sq1
+    var1 = np.divide(sq1 - n1 * mean1 * mean1, n1 - 1, out=np.full_like(sum1, np.nan), where=n1 > 1)
+    var0 = np.divide(sq0 - n0 * mean0 * mean0, n0 - 1, out=np.full_like(sum0, np.nan), where=n0 > 1)
+    pv = np.divide(
+        (n1 - 1) * var1 + (n0 - 1) * var0,
+        n1 + n0 - 2,
+        out=np.full_like(sum1, np.nan),
+        where=(n1 > 1) & (n0 > 1),
+    )
+    sd = np.sqrt(np.maximum(pv, 0.0))
+    perm_d = np.divide(
+        mean1 - mean0,
+        sd,
+        out=np.full_like(mean1, np.nan),
+        where=(n1 >= MIN_DONORS_PER_GROUP) & (n0 >= MIN_DONORS_PER_GROUP) & (sd > 0),
+    )
+    return observed_d, perm_d, n0_obs, n1_obs
+
+
+def permutation_selection(
+    score_map: Dict[str, float],
+    donor_data: dict,
+    *,
+    n_permutations: int = PERMUTATION_N,
+    alpha: float = PERMUTATION_ALPHA,
+    effect_size: float = PERMUTATION_EFFECT_SIZE,
+    random_state: int = 42,
+    cssi_mode: bool = False,
+):
+    """Return selected genes plus per-gene d/p/q audit data."""
+    items = _ranked_items(score_map)
+    genes = [str(g) for g in donor_data["genes"]]
+    gene_to_col = {g: j for j, g in enumerate(genes)}
+    labels = np.asarray(donor_data["labels"], dtype=int)
+    D = len(labels)
+    n_pd = int(np.sum(labels == 1))
+    n_ctrl = D - n_pd
+    if n_pd < MIN_DONORS_PER_GROUP or n_ctrl < MIN_DONORS_PER_GROUP:
+        raise ValueError(
+            f"Donor permutation requires >= {MIN_DONORS_PER_GROUP} donors per condition; "
+            f"got PD={n_pd}, control={n_ctrl}."
+        )
+
+    rng = np.random.default_rng(random_state)
+    perm_labels = _permutation_labels(D, n_pd, n_permutations, rng)
+    G = len(genes)
+    observed_d = np.full(G, np.nan)
+    observed_n0 = np.zeros(G, dtype=int)
+    observed_n1 = np.zeros(G, dtype=int)
+    null_stat = np.full((n_permutations, G), np.nan)
+    observed_stat = np.full(G, np.nan)
+
+    if not cssi_mode:
+        d, perm_d, n0, n1 = _permute_matrix_d(
+            np.asarray(donor_data["scores"], dtype=float), labels, perm_labels
+        )
+        observed_d[:] = d
+        observed_n0[:] = n0
+        observed_n1[:] = n1
+        observed_stat[:] = np.abs(d)
+        null_stat[:] = np.abs(perm_d)
+        test_name = "two-sided donor-label Cohen's d"
+    else:
+        # Max-|d| over strata. The same max is applied to each permutation.
+        for _, matrix in sorted(donor_data["strata"].items(), key=lambda kv: kv[0]):
+            d, perm_d, n0, n1 = _permute_matrix_d(
+                np.asarray(matrix, dtype=float), labels, perm_labels
+            )
+            abs_d = np.abs(d)
+            replace = np.isfinite(abs_d) & (
+                ~np.isfinite(observed_stat) | (abs_d > observed_stat)
+            )
+            observed_stat[replace] = abs_d[replace]
+            observed_d[replace] = d[replace]
+            observed_n0[replace] = n0[replace]
+            observed_n1[replace] = n1[replace]
+            null_stat = np.fmax(null_stat, np.abs(perm_d))
+        test_name = "two-sided donor-label Cohen's d, max-|d| over CSSI strata"
+
+    p = np.full(G, np.nan)
+    for j in range(G):
+        if not np.isfinite(observed_stat[j]):
+            continue
+        null_j = null_stat[:, j]
+        null_j = null_j[np.isfinite(null_j)]
+        if null_j.size:
+            p[j] = (1 + np.sum(null_j >= observed_stat[j])) / (null_j.size + 1)
+    q = np.full(G, np.nan)
+    finite = np.isfinite(p)
+    if finite.any():
+        q[finite] = _bh_adjust(p[finite])
+
+    audit = []
+    selected = []
+    for gene, score in items:
+        j = gene_to_col.get(gene)
+        if j is None or not np.isfinite(q[j]) or not np.isfinite(observed_d[j]):
+            continue
+        row = {
+            "gene": gene,
+            "score": float(score),
+            "cohen_d": float(observed_d[j]),
+            "p_value": float(p[j]),
+            "q_value": float(q[j]),
+            "n_donors_control": int(observed_n0[j]),
+            "n_donors_pd": int(observed_n1[j]),
+            "effect_threshold": float(effect_size),
+        }
+        audit.append(row)
+        if q[j] < alpha and abs(observed_d[j]) >= effect_size:
+            selected.append((gene, float(score), row))
+
+    selected.sort(key=lambda x: (-x[1], x[0]))
+    selected_simple = [(g, s) for g, s, _ in selected]
+    meta = {
+        "n_permutations": int(n_permutations),
+        "alpha": float(alpha),
+        "effect_size_threshold": float(effect_size),
+        "selection_rule": "q < alpha AND abs(Cohen's d) >= effect_size",
+        "two_sided": True,
+        "multiple_testing": "Benjamini-Hochberg",
+        "n_donors": D,
+        "n_donors_control": n_ctrl,
+        "n_donors_pd": n_pd,
+        "min_donors_per_group": MIN_DONORS_PER_GROUP,
+        "test": test_name,
+        "n_selected": len(selected_simple),
+    }
+    return selected_simple, meta, audit
+
+
+def select_all(score_map: Dict[str, float]):
+    items = _ranked_items(score_map)
+    if not items:
+        raise ValueError("Cannot select genes from an empty score map.")
+    return {
+        "top30": (_select_top_k(items, TOP_N), {"k": min(TOP_N, len(items))}),
+        "z-score": _zscore(items),
+        "otsu": _otsu(items),
+        "elbow": _elbow(items),
+    }
+
+
+def write_selection_csv(selected, out_csv: Path):
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_csv, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["rank", "gene", "score"])
+        for rank, (gene, score) in enumerate(selected, 1):
+            writer.writerow([rank, gene, score])
+
+
+def write_permutation_csv(audit_rows, out_csv: Path):
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    selected = sorted(audit_rows, key=lambda r: (-r["score"], r["gene"]))
+    with open(out_csv, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow([
+            "rank", "gene", "score", "cohen_d", "p_value", "q_value",
+            "n_donors_control", "n_donors_pd", "effect_threshold",
+        ])
+        for rank, row in enumerate(selected, 1):
+            writer.writerow([
+                rank, row["gene"], row["score"], row["cohen_d"], row["p_value"],
+                row["q_value"], row["n_donors_control"], row["n_donors_pd"],
+                row["effect_threshold"],
+            ])
+
+
+def write_selection_family(
+    score_map: Dict[str, float],
+    out_dir: Path,
+    *,
+    donor_data: dict,
+    cssi_mode: bool = False,
+    random_state: int = 42,
+    permutation_n: int = PERMUTATION_N,
+    permutation_alpha: float = PERMUTATION_ALPHA,
+    permutation_effect_size: float = PERMUTATION_EFFECT_SIZE,
+):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    selections = select_all(score_map)
+    summary = {}
+    for method, (selected, metadata) in selections.items():
+        path = out_dir / f"{method}.csv"
+        write_selection_csv(selected, path)
+        summary[method] = {**metadata, "n_selected": len(selected), "output": str(path)}
+
+    _, perm_meta, audit_all = permutation_selection(
+        score_map,
+        donor_data,
+        n_permutations=permutation_n,
+        alpha=permutation_alpha,
+        effect_size=permutation_effect_size,
+        random_state=random_state,
+        cssi_mode=cssi_mode,
+    )
+    # Only genes satisfying both criteria are written. `audit_all` is already
+    # score-ordered; filter here rather than changing the output ranking.
+    selected_audit = [
+        row for row in audit_all
+        if row["q_value"] < permutation_alpha
+        and abs(row["cohen_d"]) >= permutation_effect_size
+    ]
+    perm_path = out_dir / "permutation.csv"
+    write_permutation_csv(selected_audit, perm_path)
+    summary["permutation"] = {
+        **perm_meta,
+        "n_selected": len(selected_audit),
+        "output": str(perm_path),
+    }
+    with open(out_dir / "selection_summary.json", "w") as handle:
+        json.dump(summary, handle, indent=2)
+    return summary

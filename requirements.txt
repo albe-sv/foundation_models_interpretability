@@ -13,3 +13,4 @@ gprofiler-official==1.0.0
 gseapy==1.2.1
 matplotlib==3.10.8
 go3==1.0.0
+kneed==0.8.6

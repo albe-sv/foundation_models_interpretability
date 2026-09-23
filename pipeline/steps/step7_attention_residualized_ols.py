@@ -17,8 +17,9 @@ For each cell type:
 The residual is the part of the signed attention score not explained by the
 three supplied univariate gene features.
 
-This is intentionally OLS-only for the first implementation. It uses numpy
-rather than adding statsmodels as a dependency.
+The task is CPU-only. Dynamic top-N selectors are also applied to the
+residual attention scores, while `ols.csv` retains all genes ranked by the
+residual signal.
 """
 
 from pathlib import Path
@@ -32,15 +33,21 @@ import numpy as np
 import scanpy as sc
 import torch
 from scipy.sparse import issparse
+from scipy.stats import f as f_dist
 
 from pipeline import config as C
 from pipeline.steps import _step7_common as common
+from pipeline.steps import attention_dynamic_selection as dynamic
 from pipeline.utils.scgpt_model import load_model_configs, load_vocab
 
 
 DATA_DIR = C.DATA_DIR
 TRAIN_H5AD = DATA_DIR / "mixed_split" / "Mixed_HVG_1000_pc_noXY_noMT_mixed_train.h5ad"
 VAL_H5AD = DATA_DIR / "mixed_split" / "Mixed_HVG_1000_pc_noXY_noMT_mixed_val.h5ad"
+
+DYNAMIC_PERMUTATIONS = 2000
+DYNAMIC_PERMUTATION_ALPHA = 0.05
+DYNAMIC_PERMUTATION_EFFECT_SIZE = dynamic.PERMUTATION_EFFECT_SIZE
 
 
 def _load_full_dataset() -> ad.AnnData:
@@ -67,8 +74,6 @@ def _gene_features(adata: ad.AnnData) -> Dict[str, Dict[str, float]]:
         mean = np.asarray(X.mean(axis=0)).ravel()
         mean_sq = np.asarray(X.multiply(X).mean(axis=0)).ravel()
         variance = np.maximum(mean_sq - mean * mean, 0.0)
-
-        # Number of non-zero entries per gene.
         nonzero = np.asarray(X.getnnz(axis=0)).ravel()
         dropout = 1.0 - nonzero / float(n_cells)
     else:
@@ -150,6 +155,16 @@ def _ols_residualize(
     ss_tot = float(np.sum((y_fit - y_fit.mean()) ** 2))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
 
+    n_fit = int(finite.sum())
+    p_predictors = len(feature_names)
+    df_resid = n_fit - p_predictors - 1
+    if np.isfinite(r2) and df_resid > 0 and 0.0 <= r2 < 1.0:
+        f_stat = (r2 / p_predictors) / ((1.0 - r2) / df_resid)
+        f_pvalue = float(f_dist.sf(f_stat, p_predictors, df_resid))
+    else:
+        f_stat = float("nan")
+        f_pvalue = float("nan")
+
     for i, row in enumerate(rows):
         row["predicted_attention"] = float(predicted[i])
         row["residual_attention"] = float(residual[i])
@@ -172,12 +187,11 @@ def _ols_residualize(
         else:
             row["residual_zscore"] = 0.0
 
-    # Positive residual first: genes whose attention is higher than expected
-    # from expression/variance/dropout.
+    # Keep the detailed audit table sorted by predicted attention, as requested.
     rows.sort(
         key=lambda r: (
-            -r["residual_attention"]
-            if np.isfinite(r["residual_attention"])
+            -r["predicted_attention"]
+            if np.isfinite(r["predicted_attention"])
             else float("inf")
         )
     )
@@ -186,7 +200,7 @@ def _ols_residualize(
 
     metadata = {
         "n_genes": len(rows),
-        "n_genes_used": int(finite.sum()),
+        "n_genes_used": n_fit,
         "predictors": feature_names,
         "standardized_predictors": True,
         "intercept": float(beta[0]),
@@ -195,6 +209,10 @@ def _ols_residualize(
             for i, name in enumerate(feature_names)
         },
         "r_squared": r2,
+        "f_statistic": float(f_stat),
+        "f_p_value": f_pvalue,
+        "f_test_df_model": p_predictors,
+        "f_test_df_residual": df_resid,
     }
     return rows, metadata
 
@@ -221,17 +239,39 @@ def _write_csv(rows: list, out_csv: Path) -> None:
             writer.writerow({k: row[k] for k in fieldnames})
 
 
+def _write_ols_score_csv(rows: list, out_csv: Path) -> None:
+    """Write the all-gene residualized score in the standard ranking format."""
+    ranked = sorted(
+        (
+            (str(row["gene"]), float(row["residual_attention"]))
+            for row in rows
+            if np.isfinite(row["residual_attention"])
+        ),
+        key=lambda item: (-item[1], item[0]),
+    )
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_csv, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["rank", "gene", "score"])
+        for rank, (gene, score) in enumerate(ranked, start=1):
+            writer.writerow([rank, gene, score])
+
+
 def task_attention_residualized_ols(
     results_dir: Path,
     device: torch.device,
+    donor_col=None,
 ) -> None:
     """Run OLS residualization for every cell type and save all genes."""
+    if device.type != "cpu":
+        raise ValueError("attention_residualized_ols is CPU-only.")
+
     vocab, model_configs = load_vocab(), load_model_configs()
     adata = _load_full_dataset()
-    model = common._load_zero_shot_model(vocab, model_configs, device)
+    model = common._load_zero_shot_model(vocab, model_configs, torch.device("cpu"))
 
     for ct, slug, sub in _cell_type_subsets(adata):
-        print(f"\n# attention_residualized_ols | {ct} #")
+        print(f"\n# attention_residualized_ols | {ct} | CPU #", flush=True)
 
         # This deliberately uses the exact same attention computation as the
         # existing attention_zero_shot task.
@@ -241,17 +281,33 @@ def task_attention_residualized_ols(
             pt,
             vocab,
             model_configs["nheads"],
-            device,
+            torch.device("cpu"),
             n_cls=2,
             use_predictions=False,
         )
         if not gate["ok"]:
-            print(f"  skipped: {gate['reason']}")
+            print(f"  skipped: {gate['reason']}", flush=True)
             continue
 
         attention_scores = common._gene_scores(
             means,
             lambda mean_pd, mean_ctrl: mean_pd - mean_ctrl,
+        )
+
+        donor_column = dynamic.resolve_donor_column(sub, donor_col)
+        donor_ids = sub.obs[donor_column].astype(str).to_numpy()
+        print(
+            f"  donor column: {donor_column} | {np.unique(donor_ids).size} donors",
+            flush=True,
+        )
+        donor_data = dynamic.collect_donor_attention_data(
+            model,
+            pt,
+            vocab,
+            model_configs["nheads"],
+            torch.device("cpu"),
+            donor_ids,
+            need_cssi=False,
         )
 
         # Same gene universe as the attention task: genes present in the
@@ -267,29 +323,68 @@ def task_attention_residualized_ols(
             features,
         )
 
-        rows.sort(
-            key=lambda r: (
-                -r["predicted attention"]
-                if np.isfinite(r["predicted_attention"])
-                else float("inf")
-            )
-        )
-
         out_dir = results_dir / "attention_residualized_ols" / slug
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        # Preserve the detailed all-gene audit output.
         out_csv = out_dir / "residualized_genes.csv"
         _write_csv(rows, out_csv)
 
-        # Useful audit information; the requested all-gene result remains the
-        # CSV above.
+        # New standard-format OLS output: all genes ranked by residual signal.
+        _write_ols_score_csv(rows, out_dir / "csv" / "ols.csv")
+
+        # Also provide the same dynamic selectors on residualized attention.
+        residual_scores = {
+            str(row["gene"]): float(row["residual_attention"])
+            for row in rows
+            if np.isfinite(row["residual_attention"])
+        }
+
+        # Residualize each donor's gene-attention vector with the same fitted
+        # gene-level OLS prediction. This is a fixed per-gene offset, so the
+        # donor-level Cohen's d is evaluated on the residualized values while
+        # preserving the current OLS definition.
+        predicted_by_gene = {
+            str(row["gene"]): float(row["predicted_attention"])
+            for row in rows
+            if np.isfinite(row["predicted_attention"])
+        }
+        donor_genes = donor_data["genes"]
+        predicted_vector = np.asarray(
+            [predicted_by_gene.get(g, np.nan) for g in donor_genes],
+            dtype=float,
+        )
+        donor_residual_scores = donor_data["scores"] - predicted_vector[None, :]
+        donor_residual_data = {**donor_data, "scores": donor_residual_scores}
+
+        selection_summary = dynamic.write_selection_family(
+            residual_scores,
+            out_dir / "csv",
+            donor_data=donor_residual_data,
+            cssi_mode=False,
+            random_state=42,
+            permutation_n=DYNAMIC_PERMUTATIONS,
+            permutation_alpha=DYNAMIC_PERMUTATION_ALPHA,
+            permutation_effect_size=DYNAMIC_PERMUTATION_EFFECT_SIZE,
+        )
+
         with open(out_dir / "ols_summary.json", "w") as f:
             json.dump(metadata, f, indent=2)
 
         print(
             f"  wrote {out_csv} ({len(rows)} genes; "
-            f"R^2={metadata['r_squared']:.4f})"
+            f"R^2={metadata['r_squared']:.4f}; "
+            f"F={metadata['f_statistic']:.3f}; "
+            f"p={metadata['f_p_value']:.3e})",
+            flush=True,
+        )
+        print(
+            "  residual dynamic N: "
+            + ", ".join(
+                f"{method}={info['n_selected']}"
+                for method, info in selection_summary.items()
+            ),
+            flush=True,
         )
 
     del model
-    torch.cuda.empty_cache()
