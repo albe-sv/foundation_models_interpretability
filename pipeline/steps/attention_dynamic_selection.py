@@ -34,9 +34,9 @@ TOP_N = 30
 Z_THRESHOLD = 2.5
 OTSU_MAX_BINS = 256
 ELBOW_S = 1.0
-PERMUTATION_N = 2000
+PERMUTATION_N = 50000
 PERMUTATION_ALPHA = 0.05
-PERMUTATION_EFFECT_SIZE = 0.5
+PERMUTATION_EFFECT_SIZE = 0.2
 MIN_DONORS_PER_GROUP = 2
 
 
@@ -573,19 +573,26 @@ def write_selection_family(
         random_state=random_state,
         cssi_mode=cssi_mode,
     )
-    # Only genes satisfying both criteria are written. `audit_all` is already
-    # score-ordered; filter here rather than changing the output ranking.
-    selected_audit = [
-        row for row in audit_all
-        if row["q_value"] < permutation_alpha
-        and abs(row["cohen_d"]) >= permutation_effect_size
-    ]
+    # `permutation.csv` remains the selected gene set. A separate audit file
+    # contains every gene so q-values and effect sizes can be inspected even
+    # when the final selection is empty.
+    selected_audit = [row for row in audit_all if row["selected"]]
     perm_path = out_dir / "permutation.csv"
     write_permutation_csv(selected_audit, perm_path)
+
+    audit_path = out_dir / "permutation_audit.csv"
+    write_permutation_csv(audit_all, audit_path)
+
+    n_q_pass = sum(row["q_pass"] for row in audit_all)
+    n_effect_pass = sum(row["effect_pass"] for row in audit_all)
     summary["permutation"] = {
         **perm_meta,
+        "n_audit_genes": len(audit_all),
+        "n_q_pass": int(n_q_pass),
+        "n_effect_pass": int(n_effect_pass),
         "n_selected": len(selected_audit),
         "output": str(perm_path),
+        "audit_output": str(audit_path),
     }
     with open(out_dir / "selection_summary.json", "w") as handle:
         json.dump(summary, handle, indent=2)
